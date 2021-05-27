@@ -42,25 +42,26 @@ import org.apache.servicecomb.foundation.vertx.http.HttpServletResponseEx;
 import org.apache.servicecomb.foundation.vertx.http.ReadStreamPart;
 import org.apache.servicecomb.foundation.vertx.http.VertxClientRequestToHttpServletRequest;
 import org.apache.servicecomb.foundation.vertx.http.VertxClientResponseToHttpServletResponse;
-import org.apache.servicecomb.foundation.vertx.metrics.metric.DefaultHttpSocketMetric;
+import org.apache.servicecomb.foundation.vertx.metrics.DefaultClientMetrics;
+import org.apache.servicecomb.foundation.vertx.metrics.metric.DefaultRequestMetric;
 import org.apache.servicecomb.registry.definition.DefinitionConst;
 import org.apache.servicecomb.swagger.invocation.AsyncResponse;
 import org.apache.servicecomb.swagger.invocation.Response;
+import org.apache.servicecomb.swagger.invocation.context.ContextUtils;
+import org.apache.servicecomb.swagger.invocation.context.InvocationContext;
 import org.apache.servicecomb.swagger.invocation.exception.CommonExceptionData;
 import org.apache.servicecomb.swagger.invocation.exception.InvocationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
 
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientRequest;
 import io.vertx.core.http.HttpClientResponse;
-import io.vertx.core.http.HttpConnection;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
-import io.vertx.core.net.SocketAddress;
-import io.vertx.core.net.impl.ConnectionBase;
 
 public class RestClientInvocation {
   private static final Logger LOGGER = LoggerFactory.getLogger(RestClientInvocation.class);
@@ -84,7 +85,7 @@ public class RestClientInvocation {
 
   private HttpClientResponse clientResponse;
 
-  private Handler<Throwable> throwableHandler = e -> fail((ConnectionBase) clientRequest.connection(), e);
+  private Handler<Throwable> throwableHandler = e -> fail(e);
 
   private boolean alreadyFailed = false;
 
@@ -103,44 +104,51 @@ public class RestClientInvocation {
     String path = this.createRequestPath(restOperationMeta);
     IpPort ipPort = (IpPort) invocation.getEndpoint().getAddress();
 
-    createRequest(ipPort, path);
-    clientRequest.putHeader(org.apache.servicecomb.core.Const.TARGET_MICROSERVICE, invocation.getMicroserviceName());
-    RestClientRequestImpl restClientRequest =
-        new RestClientRequestImpl(clientRequest, httpClientWithContext.context(), asyncResp, throwableHandler);
-    invocation.getHandlerContext().put(RestConst.INVOCATION_HANDLER_REQUESTCLIENT, restClientRequest);
+    Future<HttpClientRequest> requestFuture = createRequest(ipPort, path);
 
-    Buffer requestBodyBuffer = restClientRequest.getBodyBuffer();
-    HttpServletRequestEx requestEx = new VertxClientRequestToHttpServletRequest(clientRequest, requestBodyBuffer);
-    invocation.getInvocationStageTrace().startClientFiltersRequest();
-    for (HttpClientFilter filter : httpClientFilters) {
-      if (filter.enabled()) {
-        filter.beforeSendRequest(invocation, requestEx);
+    requestFuture.compose(clientRequest -> {
+      this.clientRequest = clientRequest;
+
+      clientRequest.putHeader(org.apache.servicecomb.core.Const.TARGET_MICROSERVICE, invocation.getMicroserviceName());
+      RestClientRequestImpl restClientRequest =
+          new RestClientRequestImpl(clientRequest, httpClientWithContext.context(), asyncResp, throwableHandler);
+      invocation.getHandlerContext().put(RestConst.INVOCATION_HANDLER_REQUESTCLIENT, restClientRequest);
+
+      Buffer requestBodyBuffer;
+      try {
+        requestBodyBuffer = restClientRequest.getBodyBuffer();
+      } catch (Exception e) {
+        return Future.failedFuture(e);
       }
-    }
+      HttpServletRequestEx requestEx = new VertxClientRequestToHttpServletRequest(clientRequest, requestBodyBuffer);
+      invocation.getInvocationStageTrace().startClientFiltersRequest();
+      for (HttpClientFilter filter : httpClientFilters) {
+        if (filter.enabled()) {
+          filter.beforeSendRequest(invocation, requestEx);
+        }
+      }
 
-    clientRequest.exceptionHandler(e -> {
+      // 从业务线程转移到网络线程中去发送
+      invocation.onStartSendRequest();
+      httpClientWithContext.runOnContext(httpClient -> {
+        clientRequest.setTimeout(operationMeta.getConfig().getMsRequestTimeout());
+        clientRequest.response().onComplete(asyncResult -> {
+          if (asyncResult.failed()) {
+            fail(asyncResult.cause());
+            return;
+          }
+          handleResponse(asyncResult.result());
+        });
+        processServiceCombHeaders(invocation, operationMeta);
+        restClientRequest.end();
+      });
+      return Future.succeededFuture();
+    }).onFailure(failure -> {
       invocation.getTraceIdLogger()
           .error(LOGGER, "Failed to send request, alreadyFailed:{}, local:{}, remote:{}, message={}.",
               alreadyFailed, getLocalAddress(), ipPort.getSocketAddress(),
-              ExceptionUtils.getExceptionMessageWithoutTrace(e));
-      throwableHandler.handle(e);
-    });
-
-    // 从业务线程转移到网络线程中去发送
-    invocation.onStartSendRequest();
-    httpClientWithContext.runOnContext(httpClient -> {
-      clientRequest.setTimeout(operationMeta.getConfig().getMsRequestTimeout());
-      processServiceCombHeaders(invocation, operationMeta);
-      try {
-        restClientRequest.end();
-      } catch (Throwable e) {
-        invocation.getTraceIdLogger().error(LOGGER,
-            "send http request failed, alreadyFailed:{}, local:{}, remote: {}, message={}.",
-            alreadyFailed,
-            getLocalAddress(), ipPort
-            , ExceptionUtils.getExceptionMessageWithoutTrace(e));
-        fail((ConnectionBase) clientRequest.connection(), e);
-      }
+              ExceptionUtils.getExceptionMessageWithoutTrace(failure));
+      throwableHandler.handle(failure);
     });
   }
 
@@ -163,12 +171,11 @@ public class RestClientInvocation {
   }
 
   private String getLocalAddress() {
-    HttpConnection connection = clientRequest.connection();
-    if (connection == null) {
+    if (clientRequest == null || clientRequest.connection() == null
+        || clientRequest.connection().localAddress() == null) {
       return "not connected";
     }
-    SocketAddress socketAddress = connection.localAddress();
-    return socketAddress != null ? socketAddress.toString() : "not connected";
+    return clientRequest.connection().localAddress().toString();
   }
 
   private HttpMethod getMethod() {
@@ -178,23 +185,23 @@ public class RestClientInvocation {
     return HttpMethod.valueOf(method);
   }
 
-  @SuppressWarnings("deprecation")
-  void createRequest(IpPort ipPort, String path) {
+  Future<HttpClientRequest> createRequest(IpPort ipPort, String path) {
     URIEndpointObject endpoint = (URIEndpointObject) invocation.getEndpoint().getAddress();
+    HttpMethod method = getMethod();
     RequestOptions requestOptions = new RequestOptions();
     requestOptions.setHost(ipPort.getHostOrIp())
         .setPort(ipPort.getPort())
         .setSsl(endpoint.isSslEnabled())
+        .setMethod(method)
         .setURI(path);
 
-    HttpMethod method = getMethod();
     invocation.getTraceIdLogger()
         .debug(LOGGER, "Sending request by rest, method={}, qualifiedName={}, path={}, endpoint={}.",
             method,
             invocation.getMicroserviceQualifiedName(),
             path,
             invocation.getEndpoint().getEndpoint());
-    clientRequest = httpClientWithContext.getHttpClient().request(method, requestOptions, this::handleResponse);
+    return httpClientWithContext.getHttpClient().request(requestOptions);
   }
 
   protected void handleResponse(HttpClientResponse httpClientResponse) {
@@ -211,7 +218,7 @@ public class RestClientInvocation {
       invocation.getTraceIdLogger().error(LOGGER, "Failed to receive response, local:{}, remote:{}, message={}.",
           getLocalAddress(), httpClientResponse.netSocket().remoteAddress(),
           ExceptionUtils.getExceptionMessageWithoutTrace(e));
-      fail((ConnectionBase) clientRequest.connection(), e);
+      fail(e);
     });
 
     clientResponse.bodyHandler(this::processResponseBody);
@@ -222,10 +229,12 @@ public class RestClientInvocation {
    * @param responseBuf response body buffer, when download, responseBuf is null, because download data by ReadStreamPart
    */
   protected void processResponseBody(Buffer responseBuf) {
-    DefaultHttpSocketMetric httpSocketMetric = (DefaultHttpSocketMetric) ((ConnectionBase) clientRequest.connection())
-        .metric();
-    invocation.getInvocationStageTrace().finishGetConnection(httpSocketMetric.getRequestBeginTime());
-    invocation.getInvocationStageTrace().finishWriteToBuffer(httpSocketMetric.getRequestEndTime());
+    InvocationContext context = ContextUtils.getInvocationContext();
+    if (context != null) {
+      DefaultRequestMetric requestMetric = context.getLocalContext(DefaultClientMetrics.KEY_REQUEST_METRIC);
+      invocation.getInvocationStageTrace().finishGetConnection(requestMetric.getRequestBeginTime());
+      invocation.getInvocationStageTrace().finishWriteToBuffer(requestMetric.getRequestEndTime());
+    }
     invocation.getInvocationStageTrace().finishReceiveResponse();
 
     invocation.getResponseExecutor().execute(() -> {
@@ -243,10 +252,7 @@ public class RestClientInvocation {
           }
         }
       } catch (Throwable e) {
-        // already collection time from httpSocketMetric
-        // and connection maybe already belongs to other invocation in this time
-        // so set connection to null
-        fail(null, e);
+        fail(e);
       }
     });
   }
@@ -256,7 +262,7 @@ public class RestClientInvocation {
     asyncResp.complete(response);
   }
 
-  protected void fail(ConnectionBase connection, Throwable e) {
+  protected void fail(Throwable e) {
     if (alreadyFailed) {
       return;
     }
@@ -264,11 +270,11 @@ public class RestClientInvocation {
     alreadyFailed = true;
 
     InvocationStageTrace stageTrace = invocation.getInvocationStageTrace();
-    // connection maybe null when exception happens such as ssl handshake failure
-    if (connection != null) {
-      DefaultHttpSocketMetric httpSocketMetric = (DefaultHttpSocketMetric) connection.metric();
-      stageTrace.finishGetConnection(httpSocketMetric.getRequestBeginTime());
-      stageTrace.finishWriteToBuffer(httpSocketMetric.getRequestEndTime());
+    InvocationContext context = ContextUtils.getInvocationContext();
+    if (context != null) {
+      DefaultRequestMetric requestMetric = context.getLocalContext(DefaultClientMetrics.KEY_REQUEST_METRIC);
+      stageTrace.finishGetConnection(requestMetric.getRequestBeginTime());
+      stageTrace.finishWriteToBuffer(requestMetric.getRequestEndTime());
     }
 
     // even failed and did not received response, still set time for it

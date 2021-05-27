@@ -45,6 +45,7 @@ import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
 import io.vertx.core.Context;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
@@ -75,7 +76,7 @@ public class RestClientRequestImpl implements RestClientRequest {
   }
 
   public RestClientRequestImpl(HttpClientRequest request, Context context, AsyncResponse asyncResp,
-                               Handler<Throwable> throwableHandler) {
+      Handler<Throwable> throwableHandler) {
     this.context = context;
     this.asyncResp = asyncResp;
     this.request = request;
@@ -201,19 +202,20 @@ public class RestClientRequestImpl implements RestClientRequest {
     String name = entry.getKey();
     Part part = entry.getValue();
     String filename = part.getSubmittedFileName();
-    Buffer fileHeader = fileBoundaryInfo(boundary, name, part);
-    request.write(fileHeader);
 
-    new PumpFromPart(context, part).toWriteStream(request, throwableHandler).whenComplete((v, e) -> {
-      if (e != null) {
-        LOGGER.debug("Failed to sending file [{}:{}].", name, filename, e);
-        asyncResp.consumerFail(e);
-        return;
-      }
+    LOGGER.info("Start attach file [{}:{}].", name, filename);
+    request.write(fileBoundaryInfo(boundary, name, part)).compose(v ->
+        Future.fromCompletionStage(new PumpFromPart(context, part).toWriteStream(request, throwableHandler)))
+        .onComplete(r -> {
+          if (r.failed()) {
+            LOGGER.warn("Failed attach file [{}:{}].", name, filename, r.cause());
+            asyncResp.consumerFail(r.cause());
+            return;
+          }
 
-      LOGGER.debug("finish sending file [{}:{}].", name, filename);
-      attachFile(boundary, uploadsIterator);
-    });
+          LOGGER.info("Finish attach file [{}:{}].", name, filename);
+          attachFile(boundary, uploadsIterator);
+        });
   }
 
   private Buffer boundaryEndInfo(String boundary) {

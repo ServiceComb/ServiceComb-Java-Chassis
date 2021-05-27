@@ -14,37 +14,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.servicecomb.foundation.vertx.metrics.metric;
 
-import com.google.common.annotations.VisibleForTesting;
+package org.apache.servicecomb.core.metrics;
 
-public class DefaultTcpSocketMetric {
-  protected DefaultEndpointMetric endpointMetric;
+import org.apache.servicecomb.foundation.vertx.metrics.RequestContext;
+import org.apache.servicecomb.swagger.invocation.context.ContextUtils;
+import org.apache.servicecomb.swagger.invocation.context.InvocationContext;
 
-  protected boolean connected = true;
-
-  protected long connectedTime = System.nanoTime();
-
-  public DefaultTcpSocketMetric(DefaultEndpointMetric endpointMetric) {
-    this.endpointMetric = endpointMetric;
-  }
-
-  public DefaultEndpointMetric getEndpointMetric() {
-    return endpointMetric;
-  }
-
-  @VisibleForTesting
-  public boolean isConnected() {
-    return connected;
-  }
-
-  public void onDisconnect() {
-    endpointMetric.onDisconnect();
-    this.connected = false;
-  }
-
-  @VisibleForTesting
-  public long getConnectedTime() {
-    return connectedTime;
+public class RequestContextImpl implements RequestContext {
+  @Override
+  public void addLocalContext(String key, Object value) {
+    InvocationContext context = ContextUtils.getInvocationContext();
+    if (context != null) {
+      context.addLocalContext(key, value);
+    }
   }
 }

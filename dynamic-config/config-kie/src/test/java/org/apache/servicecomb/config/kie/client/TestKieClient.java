@@ -17,23 +17,10 @@
 
 package org.apache.servicecomb.config.kie.client;
 
-import com.google.common.eventbus.Subscribe;
-import io.vertx.core.Handler;
-import io.vertx.core.MultiMap;
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpClient;
-import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.HttpClientResponse;
-import io.vertx.core.http.HttpMethod;
-import io.vertx.core.json.JsonObject;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
-import mockit.Deencapsulation;
-import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
-import mockit.Mocked;
+
 import org.apache.servicecomb.config.ConfigUtil;
 import org.apache.servicecomb.config.kie.archaius.sources.KieConfigurationSourceImpl;
 import org.apache.servicecomb.config.kie.archaius.sources.KieConfigurationSourceImpl.UpdateHandler;
@@ -46,6 +33,22 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.mockito.Mockito;
+
+import com.google.common.eventbus.Subscribe;
+
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpClientRequest;
+import io.vertx.core.http.HttpClientResponse;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.json.JsonObject;
+import mockit.Deencapsulation;
+import mockit.Mock;
+import mockit.MockUp;
+import mockit.Mocked;
 
 @SuppressWarnings("deprecation")
 public class TestKieClient {
@@ -91,7 +94,7 @@ public class TestKieClient {
   @Test
   public void testRefreshKieConfig() {
     HttpClientRequest request = Mockito.mock(HttpClientRequest.class);
-    Mockito.when(request.method()).thenReturn(HttpMethod.GET);
+    Mockito.when(request.getMethod()).thenReturn(HttpMethod.GET);
     Mockito.when(request.headers()).thenReturn(MultiMap.caseInsensitiveMultiMap());
     Buffer rsp = Mockito.mock(Buffer.class);
     Mockito.when(rsp.toJsonObject()).thenReturn(new JsonObject(mockKvResponse));
@@ -104,13 +107,11 @@ public class TestKieClient {
     Mockito.when(event.statusCode()).thenReturn(200);
     HttpClient httpClient = Mockito.mock(HttpClient.class);
     Mockito.when(
-        httpClient.get(Mockito.anyInt(), Mockito.anyString(), Mockito.anyString(),
-            Mockito.any(Handler.class)))
-        .then(invocation -> {
-          Handler<HttpClientResponse> handler = invocation.getArgumentAt(3, Handler.class);
-          handler.handle(event);
-          return request;
-        });
+        httpClient.request(Mockito.any(HttpMethod.class), Mockito.anyInt(), Mockito.anyString(), Mockito.anyString()))
+        .thenReturn(Future.succeededFuture(request));
+    Mockito.when(request.send()).thenReturn(Future.succeededFuture(event));
+    Mockito.when(event.statusCode()).thenReturn(200);
+
     new MockUp<HttpClientWithContext>() {
       @Mock
       public void runOnContext(RunHandler handler) {
@@ -160,18 +161,14 @@ public class TestKieClient {
       handler.handle(rsp);
       return null;
     });
-    Mockito.when(event.statusCode()).thenReturn(400);
     Buffer buf = Mockito.mock(Buffer.class);
     Mockito.when(buf.toJsonObject()).thenReturn(new JsonObject(mockKvResponse));
     HttpClient httpClient = Mockito.mock(HttpClient.class);
     Mockito.when(
-        httpClient.get(Mockito.anyInt(), Mockito.anyString(), Mockito.anyString(),
-            Mockito.any(Handler.class)))
-        .then(invocation -> {
-          Handler<HttpClientResponse> handler = invocation.getArgumentAt(3, Handler.class);
-          handler.handle(event);
-          return request;
-        });
+        httpClient.request(Mockito.any(HttpMethod.class), Mockito.anyInt(), Mockito.anyString(), Mockito.anyString()))
+        .thenReturn(Future.succeededFuture(request));
+    Mockito.when(request.send()).thenReturn(Future.succeededFuture(event));
+    Mockito.when(event.statusCode()).thenReturn(400);
     new MockUp<HttpClientWithContext>() {
       @Mock
       public void runOnContext(RunHandler handler) {

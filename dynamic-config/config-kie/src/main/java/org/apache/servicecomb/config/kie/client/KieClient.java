@@ -36,7 +36,8 @@ import org.apache.servicecomb.foundation.vertx.client.http.HttpClients;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.vertx.core.http.HttpClientRequest;
+import io.vertx.core.Future;
+import io.vertx.core.http.HttpMethod;
 
 public class KieClient {
 
@@ -112,7 +113,6 @@ public class KieClient {
       }
     }
 
-    @SuppressWarnings("deprecation")
     void refreshConfig(CountDownLatch latch) {
       String path = "/v1/"
           + KieConfig.INSTANCE.getDomainName()
@@ -130,46 +130,49 @@ public class KieClient {
       String finalPath = path;
       HttpClients.getClient(ConfigKieHttpClientOptionsSPI.CLIENT_NAME).runOnContext(client -> {
         IpPort ipPort = NetUtils.parseIpPortFromURI(serviceUri);
-        HttpClientRequest request = client
-            .get(ipPort.getPort(), ipPort.getHostOrIp(), finalPath, rsp -> {
-              if (rsp.statusCode() == HttpStatus.SC_OK) {
-                revision = rsp.getHeader("X-Kie-Revision");
-                rsp.bodyHandler(buf -> {
-                  try {
-                    Map<String, Object> resMap = KieUtil.getConfigByLabel(JsonUtils.OBJ_MAPPER
-                        .readValue(buf.toString(), KVResponse.class));
-                    KieWatcher.INSTANCE.refreshConfigItems(resMap);
-                    EventManager.post(new ConnSuccEvent());
-                  } catch (IOException e) {
-                    EventManager.post(new ConnFailEvent(
-                        "config update result parse fail " + e.getMessage()));
-                    LOGGER.error("Config update from {} failed. Error message is [{}].",
-                        serviceUri,
-                        e.getMessage());
-                  }
-                  latch.countDown();
-                });
-              } else if (rsp.statusCode() == HttpStatus.SC_NOT_MODIFIED) {
-                EventManager.post(new ConnSuccEvent());
-                latch.countDown();
-              } else {
-                EventManager.post(new ConnFailEvent("fetch config fail"));
-                LOGGER.error("Config update from {} failed. Error code is {}, error message is [{}].",
-                    serviceUri,
-                    rsp.statusCode(),
-                    rsp.statusMessage());
-                latch.countDown();
-              }
-            }).setTimeout(timeout);
+        client
+            .request(HttpMethod.GET, ipPort.getPort(), ipPort.getHostOrIp(), finalPath)
+            .compose(request -> {
+              request.setTimeout(timeout);
 
-        request.exceptionHandler(e -> {
+              return request.send().compose(response -> {
+                if (response.statusCode() == HttpStatus.SC_OK) {
+                  revision = response.getHeader("X-Kie-Revision");
+                  response.bodyHandler(buf -> {
+                    try {
+                      Map<String, Object> resMap = KieUtil.getConfigByLabel(JsonUtils.OBJ_MAPPER
+                          .readValue(buf.toString(), KVResponse.class));
+                      KieWatcher.INSTANCE.refreshConfigItems(resMap);
+                      EventManager.post(new ConnSuccEvent());
+                    } catch (IOException e) {
+                      EventManager.post(new ConnFailEvent(
+                          "config update result parse fail " + e.getMessage()));
+                      LOGGER.error("Config update from {} failed. Error message is [{}].",
+                          serviceUri,
+                          e.getMessage());
+                    }
+                    latch.countDown();
+                  });
+                } else if (response.statusCode() == HttpStatus.SC_NOT_MODIFIED) {
+                  EventManager.post(new ConnSuccEvent());
+                  latch.countDown();
+                } else {
+                  EventManager.post(new ConnFailEvent("fetch config fail"));
+                  LOGGER.error("Config update from {} failed. Error code is {}, error message is [{}].",
+                      serviceUri,
+                      response.statusCode(),
+                      response.statusMessage());
+                  latch.countDown();
+                }
+                return Future.succeededFuture();
+              });
+            }).onFailure(failure -> {
           EventManager.post(new ConnFailEvent("fetch config fail"));
           LOGGER.error("Config update from {} failed. Error message is [{}].",
               serviceUri,
-              e.getMessage());
+              failure.getMessage());
           latch.countDown();
         });
-        request.end();
       });
     }
   }

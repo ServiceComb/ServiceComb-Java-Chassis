@@ -17,14 +17,9 @@
 
 package org.apache.servicecomb.huaweicloud.dashboard.monitor;
 
-import io.netty.handler.codec.http.HttpResponseStatus;
-import io.vertx.core.DeploymentOptions;
-import io.vertx.core.Vertx;
-import io.vertx.core.VertxOptions;
-import io.vertx.core.http.HttpClientOptions;
-import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.json.Json;
-import io.vertx.core.net.ProxyOptions;
+import java.net.UnknownHostException;
+import java.util.HashMap;
+
 import org.apache.commons.io.IOUtils;
 import org.apache.servicecomb.foundation.auth.SignRequest;
 import org.apache.servicecomb.foundation.common.event.EventManager;
@@ -49,8 +44,15 @@ import org.apache.servicecomb.serviceregistry.RegistryUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.UnknownHostException;
-import java.util.HashMap;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.vertx.core.DeploymentOptions;
+import io.vertx.core.Future;
+import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.json.Json;
+import io.vertx.core.net.ProxyOptions;
 
 public class DefaultMonitorDataPublisher implements MonitorDataPublisher {
   private static final Logger LOGGER = LoggerFactory.getLogger(DefaultMonitorDataPublisher.class);
@@ -92,54 +94,54 @@ public class DefaultMonitorDataPublisher implements MonitorDataPublisher {
 
   private void doSend(String endponit, String jsonData, String url, IpPort host, int times) {
     clientMgr.findThreadBindClientPool().runOnContext(client -> {
-      @SuppressWarnings("deprecation")
-      HttpClientRequest request = client.post(host.getPort(),
+      client.request(HttpMethod.POST, host.getPort(),
           host.getHostOrIp(),
-          url,
-          rsp -> {
-            rsp.exceptionHandler(e -> LOGGER.warn("publish error ", e));
-            if (rsp.statusCode() != HttpResponseStatus.OK.code()) {
-              if (times < MonitorConstant.MAX_RETRY_TIMES
-                  && rsp.statusCode() == HttpResponseStatus.BAD_GATEWAY.code()) {
-                doSend(endponit, jsonData, url, host, times + 1);
-                return;
-              }
-              rsp.bodyHandler(buffer -> {
-                LOGGER.warn("Send data to url {} failed and status line is {}",
-                    url,
-                    rsp.statusCode());
-                LOGGER.warn("message: {}", buffer);
-              });
+          url).compose(request -> {
+        request.setTimeout(MonitorConstant.getInterval() / MonitorConstant.MAX_RETRY_TIMES);
+
+        try {
+          SignRequest signReq = SignUtil.createSignRequest(request.getMethod().toString(),
+              endponit + url,
+              new HashMap<>(),
+              IOUtils.toInputStream(jsonData, "UTF-8"));
+          SignUtil.getAuthHeaderProviders().forEach(authHeaderProvider -> {
+            request.headers().addAll(authHeaderProvider.getSignAuthHeaders(signReq));
+          });
+        } catch (Exception e) {
+          LOGGER.error("sign request error!", e);
+        }
+        request.headers().add("environment", RegistryUtils.getMicroservice().getEnvironment());
+
+        return request.send().compose(rsp -> {
+          if (rsp.statusCode() != HttpResponseStatus.OK.code()) {
+            if (times < MonitorConstant.MAX_RETRY_TIMES
+                && rsp.statusCode() == HttpResponseStatus.BAD_GATEWAY.code()) {
+              doSend(endponit, jsonData, url, host, times + 1);
+              return Future.succeededFuture();
+            }
+            return rsp.body().compose(buffer -> {
               EventManager.post(new MonitorFailEvent("send monitor data fail."));
               addressManager.updateStates(endponit, false);
-            } else {
-              EventManager.post(new MonitorSuccEvent());
-              addressManager.updateStates(endponit, false);
-            }
-          });
-      request.setTimeout(MonitorConstant.getInterval() / MonitorConstant.MAX_RETRY_TIMES);
-      request.exceptionHandler(e -> {
-        EventManager.post(new MonitorFailEvent("send monitor data fail."));
-        LOGGER.warn("Send monitor data to {} failed , {}", endponit, e.getMessage());
-        if (e instanceof UnknownHostException) {
-          LOGGER.error("DNS resolve failed!", e);
-        }
-        addressManager.updateStates(endponit, true);
-      });
-
-      try {
-        SignRequest signReq = SignUtil.createSignRequest(request.method().toString(),
-            endponit + url,
-            new HashMap<>(),
-            IOUtils.toInputStream(jsonData, "UTF-8"));
-        SignUtil.getAuthHeaderProviders().forEach(authHeaderProvider -> {
-          request.headers().addAll(authHeaderProvider.getSignAuthHeaders(signReq));
+              LOGGER.warn("Send data to url {} failed and status line is {}",
+                  url,
+                  rsp.statusCode());
+              LOGGER.warn("message: {}", buffer);
+              return Future.succeededFuture();
+            });
+          } else {
+            EventManager.post(new MonitorSuccEvent());
+            addressManager.updateStates(endponit, false);
+          }
+          return Future.succeededFuture();
+        }).onFailure(failure -> {
+          EventManager.post(new MonitorFailEvent("send monitor data fail."));
+          LOGGER.warn("Send monitor data to {} failed , {}", endponit, failure.getMessage());
+          if (failure instanceof UnknownHostException) {
+            LOGGER.error("DNS resolve failed!", failure);
+          }
+          addressManager.updateStates(endponit, true);
         });
-        request.headers().add("environment", RegistryUtils.getMicroservice().getEnvironment());
-      } catch (Exception e) {
-        LOGGER.error("sign request error!", e);
-      }
-      request.end(jsonData);
+      });
     });
   }
 

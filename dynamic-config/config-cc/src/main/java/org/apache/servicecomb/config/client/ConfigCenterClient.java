@@ -17,15 +17,25 @@
 
 package org.apache.servicecomb.config.client;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import io.netty.handler.codec.http.HttpResponseStatus;
-import io.vertx.core.MultiMap;
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.WebSocket;
-import io.vertx.core.http.WebSocketConnectOptions;
-import io.vertx.core.http.impl.FrameType;
-import io.vertx.core.http.impl.ws.WebSocketFrameImpl;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLEncoder;
+import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.commons.lang.StringUtils;
 import org.apache.servicecomb.config.archaius.sources.ConfigCenterConfigurationSourceImpl;
 import org.apache.servicecomb.foundation.auth.AuthHeaderLoader;
@@ -39,19 +49,17 @@ import org.apache.servicecomb.foundation.vertx.client.http.HttpClients;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URLEncoder;
-import java.net.UnknownHostException;
-import java.nio.charset.StandardCharsets;
-import java.util.*;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import com.fasterxml.jackson.core.type.TypeReference;
+
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.vertx.core.Future;
+import io.vertx.core.MultiMap;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.WebSocket;
+import io.vertx.core.http.WebSocketConnectOptions;
+import io.vertx.core.http.WebSocketFrameType;
+import io.vertx.core.http.impl.ws.WebSocketFrameImpl;
 
 public class ConfigCenterClient {
 
@@ -80,9 +88,9 @@ public class ConfigCenterClient {
   private String serviceName = CONFIG_CENTER_CONFIG.getServiceName();
 
   private String environment = CONFIG_CENTER_CONFIG.getEnvironment();
-  
+
   private List<String> fileSources = CONFIG_CENTER_CONFIG.getFileSources();
-  
+
   public List<String> getFileSources() {
     return fileSources;
   }
@@ -132,29 +140,33 @@ public class ConfigCenterClient {
       String configCenter = memberDiscovery.getConfigServer();
       IpPort ipPort = NetUtils.parseIpPortFromURI(configCenter);
       HttpClients.getClient(ConfigCenterHttpClientOptionsSPI.CLIENT_NAME).runOnContext(client -> {
-        @SuppressWarnings("deprecation")
-        HttpClientRequest request =
-            client.get(ipPort.getPort(), ipPort.getHostOrIp(), uriConst.MEMBERS, rsp -> {
-              if (rsp.statusCode() == HttpResponseStatus.OK.code()) {
-                rsp.bodyHandler(buf -> {
-                  memberDiscovery.refreshMembers(buf.toJsonObject());
-                });
+
+        client.request(HttpMethod.GET, ipPort.getPort(), ipPort.getHostOrIp(), uriConst.MEMBERS)
+            .compose(request -> {
+              SignRequest signReq = createSignRequest(request.getMethod().toString(),
+                  configCenter + uriConst.MEMBERS,
+                  new HashMap<>(),
+                  null);
+              if (ConfigCenterConfig.INSTANCE.getToken() != null) {
+                request.headers().add("X-Auth-Token", ConfigCenterConfig.INSTANCE.getToken());
               }
-            });
-        SignRequest signReq = createSignRequest(request.method().toString(),
-            configCenter + uriConst.MEMBERS,
-            new HashMap<>(),
-            null);
-        if (ConfigCenterConfig.INSTANCE.getToken() != null) {
-          request.headers().add("X-Auth-Token", ConfigCenterConfig.INSTANCE.getToken());
-        }
-        request.headers()
-            .addAll(AuthHeaderLoader.getInstance().loadAuthHeaders(signReq));
-        request.exceptionHandler(e -> {
-          LOGGER.error("Fetch member from {} failed. Error message is [{}].", configCenter, e.getMessage());
-          logIfDnsFailed(e);
+              request.headers()
+                  .addAll(AuthHeaderLoader.getInstance().loadAuthHeaders(signReq));
+
+              return request.send().compose(response -> {
+                if (response.statusCode() == HttpResponseStatus.OK.code()) {
+                  return response.body().compose(buffer -> {
+                    memberDiscovery.refreshMembers(buffer.toJsonObject());
+                    return Future.succeededFuture();
+                  });
+                }
+                LOGGER.error("unexpected error code=" + response.statusCode());
+                return Future.succeededFuture();
+              });
+            }).onFailure(failure -> {
+          LOGGER.error("Fetch member from {} failed. Error message is [{}].", configCenter, failure.getMessage());
+          logIfDnsFailed(failure);
         });
-        request.end();
       });
     }
   }
@@ -290,7 +302,7 @@ public class ConfigCenterClient {
 
     private void sendHeartbeat(WebSocket ws) {
       try {
-        ws.writeFrame(new WebSocketFrameImpl(FrameType.PING));
+        ws.writeFrame(new WebSocketFrameImpl(WebSocketFrameType.PING));
         EventManager.post(new ConnSuccEvent());
       } catch (IllegalStateException e) {
         EventManager.post(new ConnFailEvent("heartbeat fail, " + e.getMessage()));
@@ -316,63 +328,59 @@ public class ConfigCenterClient {
           + ParseConfigUtils.getInstance().getCurrentVersionInfo();
       HttpClients.getClient(ConfigCenterHttpClientOptionsSPI.CLIENT_NAME).runOnContext(client -> {
         IpPort ipPort = NetUtils.parseIpPortFromURI(configcenter);
-        @SuppressWarnings("deprecation")
-        HttpClientRequest request = client.get(ipPort.getPort(), ipPort.getHostOrIp(), path, rsp -> {
-          if (rsp.statusCode() == HttpResponseStatus.OK.code()) {
-            rsp.bodyHandler(buf -> {
-              try {
-                parseConfigUtils
-                    .refreshConfigItems(JsonUtils.OBJ_MAPPER.readValue(buf.toString(),
-                        new TypeReference<LinkedHashMap<String, Map<String, Object>>>() {
-                        }));
-                EventManager.post(new ConnSuccEvent());
-              } catch (IOException e) {
-                EventManager.post(new ConnFailEvent(
-                    "config update result parse fail " + e.getMessage()));
-                LOGGER.error("Config update from {} failed. Error message is [{}].",
-                    configcenter,
-                    e.getMessage());
+
+        client.request(HttpMethod.GET, ipPort.getPort(), ipPort.getHostOrIp(), path)
+            .compose(request -> {
+              Map<String, String> headers = new HashMap<>();
+              headers.put("x-domain-name", tenantName);
+              if (ConfigCenterConfig.INSTANCE.getToken() != null) {
+                headers.put("X-Auth-Token", ConfigCenterConfig.INSTANCE.getToken());
               }
-              latch.countDown();
-            });
-          } else if (rsp.statusCode() == HttpResponseStatus.NOT_MODIFIED.code()) {
-            //nothing changed
-            EventManager.post(new ConnSuccEvent());
-            if (LOGGER.isDebugEnabled()) {
-              LOGGER.debug("Updating remote config is done. the revision {} has no change",
-                  ParseConfigUtils.getInstance().getCurrentVersionInfo());
-            }
-            latch.countDown();
-          } else {
-            rsp.bodyHandler(buf -> {
-              LOGGER.error("Server error message is [{}].", buf);
-              latch.countDown();
-            });
-            EventManager.post(new ConnFailEvent("fetch config fail"));
-            LOGGER.error("Config update from {} failed.", configcenter);
-          }
-        }).setTimeout((BOOTUP_WAIT_TIME - 1) * 1000);
-        Map<String, String> headers = new HashMap<>();
-        headers.put("x-domain-name", tenantName);
-        if (ConfigCenterConfig.INSTANCE.getToken() != null) {
-          headers.put("X-Auth-Token", ConfigCenterConfig.INSTANCE.getToken());
-        }
-        headers.put("x-environment", environment);
-        request.headers().addAll(headers);
-        request.headers()
-            .addAll(AuthHeaderLoader.getInstance().loadAuthHeaders(createSignRequest(request.method().toString(),
-                configcenter + path,
-                headers,
-                null)));
-        request.exceptionHandler(e -> {
+              headers.put("x-environment", environment);
+              request.headers().addAll(headers);
+              request.headers()
+                  .addAll(
+                      AuthHeaderLoader.getInstance().loadAuthHeaders(createSignRequest(request.getMethod().toString(),
+                          configcenter + path,
+                          headers,
+                          null)));
+              request.setTimeout((BOOTUP_WAIT_TIME - 1) * 1000);
+
+              return request.send().compose(rsp -> {
+                if (rsp.statusCode() == HttpResponseStatus.OK.code()) {
+                  return rsp.body().compose(buffer -> {
+                    try {
+                      parseConfigUtils.refreshConfigItems(JsonUtils.OBJ_MAPPER.readValue(buffer.toString(),
+                          new TypeReference<LinkedHashMap<String, Map<String, Object>>>() {
+                          }));
+                      EventManager.post(new ConnSuccEvent());
+                    } catch (IOException e) {
+                      return Future.failedFuture(e);
+                    }
+                    return Future.succeededFuture();
+                  });
+                } else if (rsp.statusCode() == HttpResponseStatus.NOT_MODIFIED.code()) {
+                  EventManager.post(new ConnSuccEvent());
+                  latch.countDown();
+                  return Future.succeededFuture();
+                } else {
+                  return rsp.body().compose(buffer -> {
+                    LOGGER.error("Config update from {} failed.", configcenter);
+                    LOGGER.error("Server error message is [{}].", buffer.toString());
+                    latch.countDown();
+                    EventManager.post(new ConnFailEvent("fetch config fail"));
+                    return Future.succeededFuture();
+                  });
+                }
+              });
+            }).onFailure(failure -> {
           EventManager.post(new ConnFailEvent("fetch config fail"));
           LOGGER.error("Config update from {} failed. Error message is [{}].",
               configcenter,
-              e.getMessage());
-          logIfDnsFailed(e);
+              failure.getMessage());
+          logIfDnsFailed(failure);
           latch.countDown();
         });
-        request.end();
       });
       if (wait) {
         try {

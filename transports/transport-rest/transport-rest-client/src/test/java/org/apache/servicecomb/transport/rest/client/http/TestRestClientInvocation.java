@@ -28,8 +28,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import javax.servlet.http.Part;
-
 import org.apache.log4j.Level;
 import org.apache.servicecomb.common.rest.RestConst;
 import org.apache.servicecomb.common.rest.definition.RestOperationMeta;
@@ -47,11 +45,14 @@ import org.apache.servicecomb.foundation.common.utils.JsonUtils;
 import org.apache.servicecomb.foundation.test.scaffolding.exception.RuntimeExceptionWithoutStackTrace;
 import org.apache.servicecomb.foundation.test.scaffolding.log.LogCollector;
 import org.apache.servicecomb.foundation.vertx.client.http.HttpClientWithContext;
+import org.apache.servicecomb.foundation.vertx.metrics.DefaultClientMetrics;
 import org.apache.servicecomb.foundation.vertx.metrics.metric.DefaultEndpointMetric;
-import org.apache.servicecomb.foundation.vertx.metrics.metric.DefaultHttpSocketMetric;
+import org.apache.servicecomb.foundation.vertx.metrics.metric.DefaultRequestMetric;
 import org.apache.servicecomb.registry.definition.DefinitionConst;
 import org.apache.servicecomb.swagger.invocation.AsyncResponse;
 import org.apache.servicecomb.swagger.invocation.Response;
+import org.apache.servicecomb.swagger.invocation.context.ContextUtils;
+import org.apache.servicecomb.swagger.invocation.context.InvocationContext;
 import org.apache.servicecomb.swagger.invocation.exception.InvocationException;
 import org.hamcrest.Matchers;
 import org.junit.Assert;
@@ -63,18 +64,14 @@ import org.mockito.Mockito;
 import com.fasterxml.jackson.core.JsonProcessingException;
 
 import io.vertx.core.Context;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientRequest;
 import io.vertx.core.http.HttpClientResponse;
-import io.vertx.core.http.RequestOptions;
-import io.vertx.core.http.impl.Http1xConnectionBaseEx;
-import io.vertx.core.http.impl.WebSocketImpl;
-import io.vertx.core.http.impl.headers.VertxHttpHeaders;
-import io.vertx.core.net.NetSocket;
-import io.vertx.core.net.SocketAddress;
+import io.vertx.core.http.impl.headers.HeadersMultiMap;
 import mockit.Deencapsulation;
 import mockit.Expectations;
 import mockit.Mock;
@@ -85,13 +82,13 @@ public class TestRestClientInvocation {
 
   private static final String TARGET_MICROSERVICE_NAME = "TargetMS";
 
-  Handler<Throwable> exceptionHandler;
-
   Handler<Buffer> bodyHandler;
 
-  MultiMap headers = new VertxHttpHeaders();
+  MultiMap headers = new HeadersMultiMap();
 
   HttpClientRequest request = mock(HttpClientRequest.class);
+
+  HttpClientResponse httpClientResponse = mock(HttpClientResponse.class);
 
   HttpClient httpClient = mock(HttpClient.class);
 
@@ -125,9 +122,6 @@ public class TestRestClientInvocation {
 
   static long nanoTime = 123;
 
-  @Mocked
-  Http1xConnectionBaseEx<WebSocketImpl> connectionBase;
-
   OperationConfig operationConfig = new OperationConfig();
 
   @BeforeClass
@@ -140,7 +134,7 @@ public class TestRestClientInvocation {
     };
   }
 
-  @SuppressWarnings({"unchecked", "deprecation"})
+  @SuppressWarnings({"unchecked"})
   @Before
   public void setup() {
     Deencapsulation.setField(restClientInvocation, "clientRequest", request);
@@ -158,14 +152,10 @@ public class TestRestClientInvocation {
     when(endpoint.getAddress()).thenReturn(address);
     when(invocation.getHandlerContext()).then(answer -> handlerContext);
     when(invocation.getInvocationStageTrace()).thenReturn(invocationStageTrace);
-    when(httpClient.request(Mockito.any(), (RequestOptions) Mockito.any(), Mockito.any()))
-        .thenReturn(request);
+    when(httpClient.request(Mockito.any()))
+        .thenReturn(Future.succeededFuture(request));
     when(request.headers()).thenReturn(headers);
-
-    doAnswer(a -> {
-      exceptionHandler = (Handler<Throwable>) a.getArguments()[0];
-      return request;
-    }).when(request).exceptionHandler(any());
+    when(request.response()).thenReturn(Future.succeededFuture(httpClientResponse));
     doAnswer(a -> {
       headers.add(a.getArgumentAt(0, String.class), a.getArgumentAt(1, String.class));
       return request;
@@ -182,6 +172,7 @@ public class TestRestClientInvocation {
       asyncResp.complete(resp);
       return null;
     }).when(request).end();
+    when(request.send()).thenReturn(Future.succeededFuture(mock(HttpClientResponse.class)));
     restClientInvocation.invoke(invocation, asyncResp);
 
     Assert.assertSame(resp, response);
@@ -200,6 +191,7 @@ public class TestRestClientInvocation {
       return null;
     }).when(request).end();
     when(invocation.isThirdPartyInvocation()).thenReturn(true);
+    when(request.send()).thenReturn(Future.succeededFuture(mock(HttpClientResponse.class)));
 
     restClientInvocation.invoke(invocation, asyncResp);
 
@@ -214,6 +206,7 @@ public class TestRestClientInvocation {
       asyncResp.complete(resp);
       return null;
     }).when(request).end();
+    when(request.send()).thenReturn(Future.succeededFuture(mock(HttpClientResponse.class)));
     when(invocation.isThirdPartyInvocation()).thenReturn(true);
     operationConfig.setClientRequestHeaderFilterEnabled(false);
 
@@ -232,6 +225,7 @@ public class TestRestClientInvocation {
   @Test
   public void invoke_endThrow() throws Exception {
     Mockito.doThrow(Error.class).when(request).end();
+    when(request.send()).thenReturn(Future.succeededFuture(mock(HttpClientResponse.class)));
     restClientInvocation.invoke(invocation, asyncResp);
 
     Assert.assertThat(((InvocationException) response.getResult()).getCause(), Matchers.instanceOf(Error.class));
@@ -243,9 +237,9 @@ public class TestRestClientInvocation {
   public void invoke_requestThrow() throws Exception {
     Throwable t = new RuntimeExceptionWithoutStackTrace();
     doAnswer(a -> {
-      exceptionHandler.handle(t);
-      return null;
+      throw t;
     }).when(request).end();
+    when(request.send()).thenReturn(Future.succeededFuture(mock(HttpClientResponse.class)));
     restClientInvocation.invoke(invocation, asyncResp);
     restClientInvocation.invoke(invocation, asyncResp);
 
@@ -261,7 +255,7 @@ public class TestRestClientInvocation {
 
     restClientInvocation.setCseContext();
 
-    Assert.assertEquals("x-cse-context: {\"k\":\"v\"}\n", headers.toString());
+    Assert.assertEquals("x-cse-context={\"k\":\"v\"}\n", headers.toString());
   }
 
   @Test
@@ -307,48 +301,6 @@ public class TestRestClientInvocation {
     Assert.assertSame(buf, response.getResult());
   }
 
-  public Part returnPart() {
-    return null;
-  }
-
-  @Test
-  public void handleResponse_readStreamPart() {
-//    HttpClientResponse httpClientResponse = mock(HttpClientResponse.class);
-//    when(httpClientResponse.statusCode()).thenReturn(200);
-//    Method method = ReflectUtils.findMethod(this.getClass(), "returnPart");
-//    when(operationMeta.getMethod()).thenReturn(method);
-//    new MockUp<RestClientInvocation>(restClientInvocation) {
-//      @Mock
-//      void processResponseBody(Buffer responseBuf) {
-//      }
-//    };
-//
-//    restClientInvocation.handleResponse(httpClientResponse);
-//
-//    Assert.assertThat(handlerContext.get(RestConst.READ_STREAM_PART), Matchers.instanceOf(ReadStreamPart.class));
-  }
-
-  @SuppressWarnings("unchecked")
-  @Test
-  public void handleResponse_responseException() {
-    HttpClientResponse httpClientResponse = mock(HttpClientResponse.class);
-
-    NetSocket netSocket = mock(NetSocket.class);
-    when(httpClientResponse.netSocket()).thenReturn(netSocket);
-    when(netSocket.remoteAddress()).thenReturn(mock(SocketAddress.class));
-
-    doAnswer(a -> {
-      exceptionHandler = (Handler<Throwable>) a.getArguments()[0];
-      return httpClientResponse;
-    }).when(httpClientResponse).exceptionHandler(any());
-
-    restClientInvocation.handleResponse(httpClientResponse);
-    RuntimeException error = new RuntimeExceptionWithoutStackTrace();
-    exceptionHandler.handle(error);
-
-    Assert.assertThat(((InvocationException) response.getResult()).getCause(), Matchers.sameInstance(error));
-  }
-
   @Test
   public void processResponseBody() {
     Response resp = Response.ok(null);
@@ -370,24 +322,11 @@ public class TestRestClientInvocation {
     }
 
     when(invocation.getResponseExecutor()).thenReturn(new ReactiveExecutor());
+    InvocationContext context = mock(InvocationContext.class);
+    Mockito.when(context.getLocalContext(DefaultClientMetrics.KEY_REQUEST_METRIC))
+        .thenReturn(new DefaultRequestMetric(new DefaultEndpointMetric("localhost:8080")));
+    ContextUtils.setInvocationContext(context);
 
-    new Expectations() {
-      {
-        connectionBase.metric();
-        result = Mockito.mock(DefaultHttpSocketMetric.class);
-      }
-    };
-
-    DefaultHttpSocketMetric httpSocketMetric = new DefaultHttpSocketMetric(Mockito.mock(DefaultEndpointMetric.class));
-    httpSocketMetric.requestBegin();
-    httpSocketMetric.requestEnd();
-    new Expectations() {
-      {
-        connectionBase.metric();
-        result = httpSocketMetric;
-      }
-    };
-    when(request.connection()).thenReturn(connectionBase);
     restClientInvocation.processResponseBody(null);
 
     Assert.assertSame(resp, response);
@@ -412,23 +351,12 @@ public class TestRestClientInvocation {
     }
 
     when(invocation.getResponseExecutor()).thenReturn(new ReactiveExecutor());
-    new Expectations() {
-      {
-        connectionBase.metric();
-        result = Mockito.mock(DefaultHttpSocketMetric.class);
-      }
-    };
 
-    DefaultHttpSocketMetric httpSocketMetric = new DefaultHttpSocketMetric(Mockito.mock(DefaultEndpointMetric.class));
-    httpSocketMetric.requestBegin();
-    httpSocketMetric.requestEnd();
-    new Expectations() {
-      {
-        connectionBase.metric();
-        result = httpSocketMetric;
-      }
-    };
-    when(request.connection()).thenReturn(connectionBase);
+    InvocationContext context = mock(InvocationContext.class);
+    Mockito.when(context.getLocalContext(DefaultClientMetrics.KEY_REQUEST_METRIC))
+        .thenReturn(new DefaultRequestMetric(new DefaultEndpointMetric("localhost:8080")));
+    ContextUtils.setInvocationContext(context);
+
     restClientInvocation.processResponseBody(null);
 
     Assert.assertThat(((InvocationException) response.getResult()).getCause(), Matchers.instanceOf(Error.class));
