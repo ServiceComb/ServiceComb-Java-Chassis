@@ -45,6 +45,7 @@ import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
 import io.vertx.core.Context;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
@@ -203,17 +204,18 @@ public class RestClientRequestImpl implements RestClientRequest {
     String filename = part.getSubmittedFileName();
 
     LOGGER.info("Start attach file [{}:{}].", name, filename);
-    request.write(fileBoundaryInfo(boundary, name, part));
-    new PumpFromPart(context, part).toWriteStream(request, throwableHandler).whenComplete((v, e) -> {
-      if (e != null) {
-        LOGGER.warn("Failed attach file [{}:{}].", name, filename, e);
-        asyncResp.consumerFail(e);
-        return;
-      }
+    request.write(fileBoundaryInfo(boundary, name, part)).compose(v ->
+        Future.fromCompletionStage(new PumpFromPart(context, part).toWriteStream(request, throwableHandler)))
+        .onComplete(r -> {
+          if (r.failed()) {
+            LOGGER.warn("Failed attach file [{}:{}].", name, filename, r.cause());
+            asyncResp.consumerFail(r.cause());
+            return;
+          }
 
-      LOGGER.info("Finish attach file [{}:{}].", name, filename);
-      attachFile(boundary, uploadsIterator);
-    });
+          LOGGER.info("Finish attach file [{}:{}].", name, filename);
+          attachFile(boundary, uploadsIterator);
+        });
   }
 
   private Buffer boundaryEndInfo(String boundary) {
